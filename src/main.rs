@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -8,21 +9,32 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+// 1. Represents the dynamic types our language supports at runtime
+#[derive(Debug, Clone)]
+enum RuntimeValue {
+    Int(u16),
+    Str(String),
+    Bool(bool),
+}
+
 // Represents our parsed language commands
 #[derive(Debug)]
 enum Command {
+    VariableAssign {
+        name: String,
+        value: RuntimeValue,
+    },
     StartServer {
-        port: u16,
-        file_descriptor: String,
-        is_project: bool,
+        port_expr: String, // Can be a raw number or a variable name
+        file_expr: String,
+        bool_expr: String,
     },
     EndServer {
-        port: u16,
+        port_expr: String,
     },
 }
 
 fn main() {
-    // 1. Get the file path from command line arguments
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         println!("Usage: cargo run -- <filename>.web");
@@ -32,13 +44,11 @@ fn main() {
     let file_path = &args[1];
     let path = Path::new(file_path);
 
-    // 2. Strict file extension check
     if path.extension().and_then(|s| s.to_str()) != Some("web") {
         eprintln!("Error: This program strictly only accepts '.web' files.");
         return;
     }
 
-    // 3. Read the file content
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
@@ -47,145 +57,166 @@ fn main() {
         }
     };
 
-    println!("Parsing {}...", file_path);
+    println!("Parsing and executing {}...", file_path);
     let commands = parse_web_lang(&content);
 
-    // 4. Execute the parsed commands
-    // We use a shared atomic flag so an end_server command can signal a running server thread to stop.
+    // This is our Environment / Runtime Memory
+    let mut environment: HashMap<String, RuntimeValue> = HashMap::new();
     let running_flag = Arc::new(AtomicBool::new(true));
 
+    // 2. Interpreter Loop
     for command in commands {
         match command {
-            Command::StartServer { port, file_descriptor, is_project } => {
+            Command::VariableAssign { name, value } => {
+                println!("💼 Storing variable: {} = {:?}", name, value);
+                environment.insert(name, value);
+            }
+            Command::StartServer { port_expr, file_expr, bool_expr } => {
+                // Resolve variables from environment, or fallback to literal parsing
+                let port = resolve_port(&port_expr, &environment);
+                let file_descriptor = resolve_string(&file_expr, &environment);
+                let is_project = resolve_bool(&bool_expr, &environment);
+
                 let flag = Arc::clone(&running_flag);
-                println!("🚀 Executing: start_server on port {}, serving '{}'...", port, file_descriptor);
+                println!("🚀 Executing: start_server(port: {}, file_descriptor: \"{}\", is_project: {})", port, file_descriptor, is_project);
                 
-                // Run the server in a separate thread so it doesn't block the execution of subsequent commands
                 thread::spawn(move || {
                     run_server(port, file_descriptor, is_project, flag);
                 });
                 
-                // Give the server a brief moment to bind to the port before running next commands
                 thread::sleep(Duration::from_millis(100));
             }
-            Command::EndServer { port } => {
+            Command::EndServer { port_expr } => {
+                let port = resolve_port(&port_expr, &environment);
                 println!("🛑 Executing: end_server on port {}...", port);
                 running_flag.store(false, Ordering::SeqCst);
                 
-                // Trigger a dummy connection to unblock the TcpListener loop so it can exit cleanly
                 if let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{}", port)) {
                     let _ = stream.write_all(b"GET / HTTP/1.1\r\n\r\n");
                 }
-                println!("Server on port {} has been signaled to shut down.", port);
             }
         }
     }
 
-    // Keep the main thread alive for a bit if a server is running
-    // In a mature language, this would be replaced by an event-loop or join handles.
-    println!("Execution finished. Keeping process alive for 30 seconds (Press Ctrl+C to exit)...");
+    println!("Execution finished. Keeping process alive for 30 seconds...");
     thread::sleep(Duration::from_secs(30));
 }
 
-/// A rudimentary parser for our .web syntax
+/// A parser that handles variables and functions
 fn parse_web_lang(input: &str) -> Vec<Command> {
     let mut commands = Vec::new();
 
     for line in input.lines() {
         let line = line.trim();
+        // Skip empty lines or lines starting with '//'
         if line.is_empty() || line.starts_with("//") {
-            continue; // Skip empty lines and comments
+            continue;
         }
 
-        if line.starts_with("start_server") {
-            // Quick and dirty extraction of what's inside the parentheses
+        // Match: const x = 10;
+        if line.starts_with("const ") {
+            let clean_line = line.trim_end_matches(';');
+            let parts: Vec<&str> = clean_line["const ".len()..].split('=').map(|s| s.trim()).collect();
+            
+            if parts.len() == 2 {
+                let var_name = parts[0].to_string();
+                let raw_val = parts[1];
+
+                // Determine type dynamically based on syntax literals
+                let value = if raw_val.starts_with('"') && raw_val.ends_with('"') {
+                    RuntimeValue::Str(raw_val.trim_matches('"').to_string())
+                } else if raw_val == "true" || raw_val == "false" {
+                    RuntimeValue::Bool(raw_val.parse().unwrap_or(false))
+                } else {
+                    RuntimeValue::Int(raw_val.parse().unwrap_or(0))
+                };
+
+                commands.push(Command::VariableAssign { name: var_name, value });
+            }
+        } 
+        // Match: start_server(...)
+        else if line.starts_with("start_server") {
             if let (Some(start), Some(end)) = (line.find('('), line.rfind(')')) {
                 let args_str = &line[start + 1..end];
                 let args: Vec<&str> = args_str.split(',').map(|s| s.trim()).collect();
 
                 if args.len() == 3 {
-                    let port = parse_port(args[0]);
-                    let file_descriptor = parse_string(args[1]);
-                    let is_project = parse_bool(args[2]);
+                    // Strip labels like "port:" to isolate the variable or literal expressions
+                    let port_expr = args[0].replace("port:", "").trim().to_string();
+                    let file_expr = args[1].replace("file_descriptor:", "").trim().to_string();
+                    let bool_expr = args[2].replace("is_project:", "").trim().to_string();
 
-                    commands.push(Command::StartServer { port, file_descriptor, is_project });
+                    commands.push(Command::StartServer { port_expr, file_expr, bool_expr });
                 }
             }
-        } else if line.starts_with("end_server") {
+        }
+        // Match: end_server(...)
+        else if line.starts_with("end_server") {
             if let (Some(start), Some(end)) = (line.find('('), line.rfind(')')) {
-                let args_str = &line[start + 1..end];
-                let port = parse_port(args_str);
-
-                commands.push(Command::EndServer { port });
+                let port_expr = line[start + 1..end].replace("port:", "").trim().to_string();
+                commands.push(Command::EndServer { port_expr });
             }
         }
     }
     commands
 }
 
-// Parsing Helpers
-fn parse_port(s: &str) -> u16 {
-    s.replace("port:", "").trim().parse().unwrap_or(8080)
+// --- Variable Resolution Helpers ---
+
+fn resolve_port(expr: &str, env: &HashMap<String, RuntimeValue>) -> u16 {
+    // If it's a variable in memory, extract it
+    if let Some(RuntimeValue::Int(val)) = env.get(expr) {
+        return *val;
+    }
+    // Otherwise, try to parse it as a direct integer literal
+    expr.parse().unwrap_or(8080)
 }
 
-fn parse_string(s: &str) -> String {
-    let clean = s.replace("file_descriptor:", "");
-    clean.trim().trim_matches('"').to_string()
+fn resolve_string(expr: &str, env: &HashMap<String, RuntimeValue>) -> String {
+    if let Some(RuntimeValue::Str(val)) = env.get(expr) {
+        return val.clone();
+    }
+    expr.trim_matches('"').to_string()
 }
 
-fn parse_bool(s: &str) -> bool {
-    let clean = s.replace("is_project:", "");
-    clean.trim().parse().unwrap_or(false)
+fn resolve_bool(expr: &str, env: &HashMap<String, RuntimeValue>) -> bool {
+    if let Some(RuntimeValue::Bool(val)) = env.get(expr) {
+        return *val;
+    }
+    expr.parse().unwrap_or(false)
 }
 
-/// Simple HTTP Server implementation
+// --- Server Engine ---
 fn run_server(port: u16, file_descriptor: String, _is_project: bool, running: Arc<AtomicBool>) {
     let listener = match TcpListener::bind(format!("127.0.0.1:{}", port)) {
         Ok(l) => l,
-        Err(e) => {
-            eprintln!("Failed to bind to port {}: {}", port, e);
-            return;
-        }
+        Err(_) => return,
     };
 
-    // Set a timeout so incoming connections don't block indefinitely when shutting down
-    let _ = listener.set_nonblocking(false); 
-
     for stream in listener.incoming() {
-        if !running.load(Ordering::SeqCst) {
-            break; // Stop accepting connections if end_server was called
-        }
-
+        if !running.load(Ordering::SeqCst) { break; }
         if let Ok(stream) = stream {
             handle_connection(stream, &file_descriptor);
         }
     }
-    println!("Server on port {} stopped.", port);
 }
 
 fn handle_connection(mut stream: TcpStream, file_to_serve: &str) {
     let buf_reader = BufReader::new(&mut stream);
-    let _http_request: Vec<_> = buf_reader
-        .lines()
-        .map(|result| result.unwrap())
-        .take_while(|line| !line.is_empty())
-        .collect();
+    let _req: Vec<_> = buf_reader.lines().map(|r| r.unwrap()).take_while(|l| !l.is_empty()).collect();
 
-    // Read the file requested by the language syntax, default to a fallback string if missing
-    let (status_line, filename) = if Path::new(file_to_serve).exists() {
+    let (status, filename) = if Path::new(file_to_serve).exists() {
         ("HTTP/1.1 200 OK", file_to_serve)
     } else {
         ("HTTP/1.1 404 NOT FOUND", "")
     };
 
     let contents = if !filename.is_empty() {
-        fs::read_to_string(filename).unwrap_or_else(|_| "<h1>404 Error</h1>".to_string())
+        fs::read_to_string(filename).unwrap_or_else(|_| "<h1>Error</h1>".to_string())
     } else {
-        format!("<h1>File '{}' not found locally!</h1><p>Your .web code requested this file, but it doesn't exist.</p>", file_to_serve)
+        format!("<h1>File '{}' not found</h1>", file_to_serve)
     };
 
-    let length = contents.len();
-    let response = format!("{status_line}\r\nContent-Length: {length}\r\n\r\n{contents}");
-
+    let response = format!("{status}\r\nContent-Length: {}\r\n\r\n{contents}", contents.len());
     let _ = stream.write_all(response.as_bytes());
 }

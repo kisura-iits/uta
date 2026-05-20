@@ -1,0 +1,6 @@
+// variables
+const my_port = 8080;
+const page = "index.html";
+const check = false;
+
+start_server(port: my_port, file_descriptor: page, is_project: check);
