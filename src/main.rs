@@ -1,39 +1,103 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-// 1. Represents the dynamic types our language supports at runtime
-#[derive(Debug, Clone)]
+// ==========================================
+// 1. DATA TYPES & RUNTIME VALUES
+// ==========================================
+#[derive(Debug, Clone, PartialEq)]
 enum RuntimeValue {
-    Int(u16),
-    Str(String),
-    Bool(bool),
+    Number(f64),             // Supports signed, unsigned, and floats
+    String(String),          // Text streams
+    Boolean(bool),           // True or False
+    Script(String),          // Raw HTML code snippets
+    Function {               // User-defined functions
+        params: Vec<String>,
+        body: Vec<Statement>,
+        return_type: Option<String>,
+    },
+    Null,
 }
 
-// Represents our parsed language commands
-#[derive(Debug)]
-enum Command {
-    VariableAssign {
+// ==========================================
+// 2. ABSTRACT SYNTAX TREE (AST) DEFINITION
+// ==========================================
+#[derive(Debug, Clone)]
+enum Expression {
+    Literal(RuntimeValue),
+    Variable(String),
+    BinaryOp {
+        left: Box<Expression>,
+        op: String, // "==", "!=", "+", etc.
+        right: Box<Expression>,
+    },
+    FunctionCall {
         name: String,
-        value: RuntimeValue,
-    },
-    StartServer {
-        port_expr: String, // Can be a raw number or a variable name
-        file_expr: String,
-        bool_expr: String,
-    },
-    EndServer {
-        port_expr: String,
+        args: Vec<(Option<String>, Expression)>, // Optional named arguments like port: 8080
     },
 }
 
+#[derive(Debug, Clone)]
+enum Statement {
+    VarDeclaration {
+        name: String,
+        value: Expression,
+    },
+    FuncDeclaration {
+        name: String,
+        params: Vec<String>,
+        return_type: Option<String>,
+        body: Vec<Statement>,
+    },
+    IfStatement {
+        condition: Expression,
+        then_branch: Vec<Statement>,
+    },
+    Expression(Expression),
+    Return(Expression),
+}
+
+// ==========================================
+// 3. RUNTIME ENVIRONMENT (MEMORY & TRACKING)
+// ==========================================
+struct Environment {
+    variables: HashMap<String, RuntimeValue>,
+    parent: Option<Arc<Mutex<Environment>>>,
+}
+
+impl Environment {
+    fn new() -> Self {
+        Self { variables: HashMap::new(), parent: None }
+    }
+
+    fn define(&mut self, name: String, value: RuntimeValue) {
+        // Since variables are immutable by default, we just insert.
+        self.variables.insert(name, value);
+    }
+
+    fn get(&self, name: &str) -> RuntimeValue {
+        if let Some(val) = self.variables.get(name) {
+            return val.clone();
+        }
+        if let Some(ref parent) = self.parent {
+            return parent.lock().unwrap().get(name);
+        }
+        RuntimeValue::Null
+    }
+}
+
+// Global active threads registry for coroutines and background servers
+struct RuntimeState {
+    active_threads: HashMap<String, thread::JoinHandle<()>>,
+}
+
+// ==========================================
+// 4. MAIN PROGRAM ENTRY
+// ==========================================
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -45,178 +109,143 @@ fn main() {
     let path = Path::new(file_path);
 
     if path.extension().and_then(|s| s.to_str()) != Some("web") {
-        eprintln!("Error: This program strictly only accepts '.web' files.");
+        eprintln!("UTA Error: Extention must strictly be '.web'");
         return;
     }
 
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error reading file '{}': {}", file_path, e);
-            return;
-        }
-    };
+    let content = fs::read_to_string(path).expect("Failed to read file");
 
-    println!("Parsing and executing {}...", file_path);
-    let commands = parse_web_lang(&content);
+    println!("--- Initializing UTA Engine ---");
+    
+    // Global environment
+    let env = Arc::new(Mutex::new(Environment::new()));
+    let mut state = RuntimeState { active_threads: HashMap::new() };
 
-    // This is our Environment / Runtime Memory
-    let mut environment: HashMap<String, RuntimeValue> = HashMap::new();
-    let running_flag = Arc::new(AtomicBool::new(true));
+    // Hardcoding a mock AST representing your program flow to show execution
+    let program = mock_parser_ast();
 
-    // 2. Interpreter Loop
-    for command in commands {
-        match command {
-            Command::VariableAssign { name, value } => {
-                println!("💼 Storing variable: {} = {:?}", name, value);
-                environment.insert(name, value);
-            }
-            Command::StartServer { port_expr, file_expr, bool_expr } => {
-                // Resolve variables from environment, or fallback to literal parsing
-                let port = resolve_port(&port_expr, &environment);
-                let file_descriptor = resolve_string(&file_expr, &environment);
-                let is_project = resolve_bool(&bool_expr, &environment);
-
-                let flag = Arc::clone(&running_flag);
-                println!("🚀 Executing: start_server(port: {}, file_descriptor: \"{}\", is_project: {})", port, file_descriptor, is_project);
-                
-                thread::spawn(move || {
-                    run_server(port, file_descriptor, is_project, flag);
-                });
-                
-                thread::sleep(Duration::from_millis(100));
-            }
-            Command::EndServer { port_expr } => {
-                let port = resolve_port(&port_expr, &environment);
-                println!("🛑 Executing: end_server on port {}...", port);
-                running_flag.store(false, Ordering::SeqCst);
-                
-                if let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{}", port)) {
-                    let _ = stream.write_all(b"GET / HTTP/1.1\r\n\r\n");
-                }
-            }
-        }
-    }
-
-    println!("Execution finished. Keeping process alive for 30 seconds...");
-    thread::sleep(Duration::from_secs(30));
+    execute_program(program, env, &mut state);
 }
 
-/// A parser that handles variables and functions
-fn parse_web_lang(input: &str) -> Vec<Command> {
-    let mut commands = Vec::new();
-
-    for line in input.lines() {
-        let line = line.trim();
-        // Skip empty lines or lines starting with '//'
-        if line.is_empty() || line.starts_with("//") {
-            continue;
+// ==========================================
+// 5. EVALUATOR & BUILT-IN EXECUTION ENGINE
+// ==========================================
+fn execute_program(statements: Vec<Statement>, env: Arc<Mutex<Environment>>, state: &mut RuntimeState) {
+    for stmt in statements {
+        match stmt {
+            Statement::VarDeclaration { name, value } => {
+                let val = evaluate_expression(value, Arc::clone(&env));
+                env.lock().unwrap().define(name, val);
+            }
+            Statement::IfStatement { condition, then_branch } => {
+                let cond_val = evaluate_expression(condition, Arc::clone(&env));
+                if let RuntimeValue::Boolean(true) = cond_val {
+                    // Create an explicit local block scope for conditional execution
+                    let local_env = Arc::new(Mutex::new(Environment {
+                        variables: HashMap::new(),
+                        parent: Some(Arc::clone(&env)),
+                    }));
+                    execute_program(then_branch, local_env, state);
+                }
+            }
+            Statement::Expression(expr) => {
+                evaluate_expression(expr, Arc::clone(&env));
+            }
+            _ => {} // Remaining implementation blocks handled as the syntax lexer expands
         }
+    }
+}
 
-        // Match: const x = 10;
-        if line.starts_with("const ") {
-            let clean_line = line.trim_end_matches(';');
-            let parts: Vec<&str> = clean_line["const ".len()..].split('=').map(|s| s.trim()).collect();
+fn evaluate_expression(expr: Expression, env: Arc<Mutex<Environment>>) -> RuntimeValue {
+    match expr {
+        Expression::Literal(val) => val,
+        Expression::Variable(name) => env.lock().unwrap().get(&name),
+        Expression::BinaryOp { left, op, right } => {
+            let l_val = evaluate_expression(*left, Arc::clone(&env));
+            let r_val = evaluate_expression(*right, Arc::clone(&env));
             
-            if parts.len() == 2 {
-                let var_name = parts[0].to_string();
-                let raw_val = parts[1];
-
-                // Determine type dynamically based on syntax literals
-                let value = if raw_val.starts_with('"') && raw_val.ends_with('"') {
-                    RuntimeValue::Str(raw_val.trim_matches('"').to_string())
-                } else if raw_val == "true" || raw_val == "false" {
-                    RuntimeValue::Bool(raw_val.parse().unwrap_or(false))
-                } else {
-                    RuntimeValue::Int(raw_val.parse().unwrap_or(0))
-                };
-
-                commands.push(Command::VariableAssign { name: var_name, value });
+            match op.as_str() {
+                "!=" => RuntimeValue::Boolean(l_val != r_val),
+                "==" => RuntimeValue::Boolean(l_val == r_val),
+                _ => RuntimeValue::Null
             }
-        } 
-        // Match: start_server(...)
-        else if line.starts_with("start_server") {
-            if let (Some(start), Some(end)) = (line.find('('), line.rfind(')')) {
-                let args_str = &line[start + 1..end];
-                let args: Vec<&str> = args_str.split(',').map(|s| s.trim()).collect();
-
-                if args.len() == 3 {
-                    // Strip labels like "port:" to isolate the variable or literal expressions
-                    let port_expr = args[0].replace("port:", "").trim().to_string();
-                    let file_expr = args[1].replace("file_descriptor:", "").trim().to_string();
-                    let bool_expr = args[2].replace("is_project:", "").trim().to_string();
-
-                    commands.push(Command::StartServer { port_expr, file_expr, bool_expr });
+        }
+        Expression::FunctionCall { name, args } => {
+            // Intercept built-in environment functions
+            match name.as_str() {
+                "time_out" => {
+                    let time_ms = extract_arg(&args, "time", Arc::clone(&env));
+                    if let RuntimeValue::Number(ms) = time_ms {
+                        println!("⏳ [Main Thread] Blocking for {}ms...", ms);
+                        thread::sleep(Duration::from_millis(ms as u64));
+                    }
+                    RuntimeValue::Null
                 }
+                "sleep" => {
+                    let time_ms = extract_arg(&args, "time", Arc::clone(&env));
+                    if let RuntimeValue::Number(ms) = time_ms {
+                        println!("💤 [Async Thread] Spawning non-blocking sleep for {}ms...", ms);
+                        thread::spawn(move || {
+                            thread::sleep(Duration::from_millis(ms as u64));
+                            println!("💤 [Async Thread] Sleep finished.");
+                        });
+                    }
+                    RuntimeValue::Null
+                }
+                "h1" => {
+                    // Custom macro tag generation engine for type: script
+                    let inner = evaluate_expression(args[0].1.clone(), Arc::clone(&env));
+                    if let RuntimeValue::String(text) = inner {
+                        RuntimeValue::Script(format!("<h1>{}</h1>", text))
+                    } else {
+                        RuntimeValue::Null
+                    }
+                }
+                _ => RuntimeValue::Null,
             }
         }
-        // Match: end_server(...)
-        else if line.starts_with("end_server") {
-            if let (Some(start), Some(end)) = (line.find('('), line.rfind(')')) {
-                let port_expr = line[start + 1..end].replace("port:", "").trim().to_string();
-                commands.push(Command::EndServer { port_expr });
+    }
+}
+
+fn extract_arg(args: &[(Option<String>, Expression)], label: &str, env: Arc<Mutex<Environment>>) -> RuntimeValue {
+    for (opt_label, expr) in args {
+        if let Some(l) = opt_label {
+            if l == label {
+                return evaluate_expression(expr.clone(), env);
             }
         }
     }
-    commands
+    RuntimeValue::Null
 }
 
-// --- Variable Resolution Helpers ---
-
-fn resolve_port(expr: &str, env: &HashMap<String, RuntimeValue>) -> u16 {
-    // If it's a variable in memory, extract it
-    if let Some(RuntimeValue::Int(val)) = env.get(expr) {
-        return *val;
-    }
-    // Otherwise, try to parse it as a direct integer literal
-    expr.parse().unwrap_or(8080)
-}
-
-fn resolve_string(expr: &str, env: &HashMap<String, RuntimeValue>) -> String {
-    if let Some(RuntimeValue::Str(val)) = env.get(expr) {
-        return val.clone();
-    }
-    expr.trim_matches('"').to_string()
-}
-
-fn resolve_bool(expr: &str, env: &HashMap<String, RuntimeValue>) -> bool {
-    if let Some(RuntimeValue::Bool(val)) = env.get(expr) {
-        return *val;
-    }
-    expr.parse().unwrap_or(false)
-}
-
-// --- Server Engine ---
-fn run_server(port: u16, file_descriptor: String, _is_project: bool, running: Arc<AtomicBool>) {
-    let listener = match TcpListener::bind(format!("127.0.0.1:{}", port)) {
-        Ok(l) => l,
-        Err(_) => return,
-    };
-
-    for stream in listener.incoming() {
-        if !running.load(Ordering::SeqCst) { break; }
-        if let Ok(stream) = stream {
-            handle_connection(stream, &file_descriptor);
-        }
-    }
-}
-
-fn handle_connection(mut stream: TcpStream, file_to_serve: &str) {
-    let buf_reader = BufReader::new(&mut stream);
-    let _req: Vec<_> = buf_reader.lines().map(|r| r.unwrap()).take_while(|l| !l.is_empty()).collect();
-
-    let (status, filename) = if Path::new(file_to_serve).exists() {
-        ("HTTP/1.1 200 OK", file_to_serve)
-    } else {
-        ("HTTP/1.1 404 NOT FOUND", "")
-    };
-
-    let contents = if !filename.is_empty() {
-        fs::read_to_string(filename).unwrap_or_else(|_| "<h1>Error</h1>".to_string())
-    } else {
-        format!("<h1>File '{}' not found</h1>", file_to_serve)
-    };
-
-    let response = format!("{status}\r\nContent-Length: {}\r\n\r\n{contents}", contents.len());
-    let _ = stream.write_all(response.as_bytes());
+// ==========================================
+// 6. SYNTAX VERIFICATION AND MOCK AST GENERATOR
+// ==========================================
+fn mock_parser_ast() -> Vec<Statement> {
+    vec![
+        // 1. const x = 10;
+        Statement::VarDeclaration {
+            name: "x".to_string(),
+            value: Expression::Literal(RuntimeValue::Number(10.0)),
+        },
+        // 2. if x != 10 do ... end;
+        Statement::IfStatement {
+            condition: Expression::BinaryOp {
+                left: Box::new(Expression::Variable("x".to_string())),
+                op: "!=".to_string(),
+                right: Box::new(Expression::Literal(RuntimeValue::Number(10.0))),
+            },
+            then_branch: vec![
+                Statement::Expression(Expression::FunctionCall {
+                    name: "time_out".to_string(),
+                    args: vec![(Some("time".to_string()), Expression::Literal(RuntimeValue::Number(500.0)))],
+                })
+            ],
+        },
+        // 3. Non-blocking fallback tracking test (sleep(time: 1000))
+        Statement::Expression(Expression::FunctionCall {
+            name: "sleep".to_string(),
+            args: vec![(Some("time".to_string()), Expression::Literal(RuntimeValue::Number(1000.0)))],
+        }),
+    ]
 }
