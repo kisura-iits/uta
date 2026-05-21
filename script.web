@@ -1,1 +1,6 @@
-start_server(port: 8080, file_descriptor: "index.html", is_project: false);
+// Main entry — paths resolve relative to this .web file
+const port = 8080;
+const file_descriptor = "index.html";
+const is_project = false;
+
+start_server(port: port, file_descriptor: file_descriptor, is_project: is_project);

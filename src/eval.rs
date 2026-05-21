@@ -38,26 +38,32 @@ impl Environment {
     }
 
     pub fn get(&self, name: &str) -> RuntimeValue {
+        self.try_get(name).unwrap_or(RuntimeValue::Null)
+    }
+
+    pub fn try_get(&self, name: &str) -> Option<RuntimeValue> {
         if let Some(val) = self.variables.get(name) {
-            return val.clone();
+            return Some(val.clone());
         }
         if let Some(ref parent) = self.parent {
-            return parent.lock().unwrap().get(name);
+            return parent.lock().unwrap().try_get(name);
         }
-        RuntimeValue::Null
+        None
     }
 }
 
 pub struct RuntimeState {
     pub active_coroutines: HashMap<String, thread::JoinHandle<()>>,
     pub servers: HashMap<u16, Arc<AtomicBool>>,
+    pub script_dir: std::path::PathBuf,
 }
 
 impl RuntimeState {
-    pub fn new() -> Self {
+    pub fn new(script_dir: std::path::PathBuf) -> Self {
         Self {
             active_coroutines: HashMap::new(),
             servers: HashMap::new(),
+            script_dir,
         }
     }
 
@@ -141,7 +147,11 @@ fn evaluate_expression(
 ) -> Result<RuntimeValue, String> {
     match expr {
         Expression::Literal(val) => Ok(val),
-        Expression::Variable(name) => Ok(env.lock().unwrap().get(&name)),
+        Expression::Variable(name) => env
+            .lock()
+            .unwrap()
+            .try_get(&name)
+            .ok_or_else(|| format!("Undefined variable '{}'", name)),
         Expression::BinaryOp { left, op, right } => {
             let l_val = evaluate_expression(*left, Arc::clone(&env), state)?;
             let r_val = evaluate_expression(*right, Arc::clone(&env), state)?;
@@ -155,20 +165,29 @@ fn evaluate_expression(
     }
 }
 
+fn is_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "time_out" | "sleep" | "start_server" | "end_server" | "start_coroutine" | "end_coroutine"
+    )
+}
+
 fn evaluate_call(
     name: &str,
     args: &[(Option<String>, Expression)],
     env: Arc<Mutex<Environment>>,
     state: &mut RuntimeState,
 ) -> Result<RuntimeValue, String> {
-    let callee = env.lock().unwrap().get(name);
-    if let RuntimeValue::Function {
-        params,
-        body,
-        return_type: _,
-    } = callee
-    {
-        return call_user_function(params, body, args, env, state);
+    if !is_builtin(name) {
+        let callee = env.lock().unwrap().get(name);
+        if let RuntimeValue::Function {
+            params,
+            body,
+            return_type: _,
+        } = callee
+        {
+            return call_user_function(params, body, args, env, state);
+        }
     }
 
     match name {
@@ -191,10 +210,10 @@ fn evaluate_call(
         "start_server" => {
             let port_val = extract_arg(args, "port", Arc::clone(&env), state)?;
             let file_val = extract_arg(args, "file_descriptor", Arc::clone(&env), state)?;
-            let timeout_val = extract_arg(args, "time_out", Arc::clone(&env), state)?;
+            let timeout_val = extract_optional_arg(args, "time_out", Arc::clone(&env), state)?;
 
             let port = runtime_number(port_val, "port")? as u16;
-            let file_path = runtime_string(file_val, "file_descriptor")?;
+            let file_path = resolve_script_path(&state.script_dir, runtime_string(file_val, "file_descriptor")?);
 
             state.stop_server(port);
             thread::sleep(Duration::from_millis(50));
@@ -229,8 +248,9 @@ fn evaluate_call(
 
             if let RuntimeValue::Function { params, body, .. } = func_val {
                 let child = Arc::new(Mutex::new(Environment::child(Arc::clone(&env))));
+                let script_dir = state.script_dir.clone();
                 let handle = thread::spawn(move || {
-                    let mut local_state = RuntimeState::new();
+                    let mut local_state = RuntimeState::new(script_dir);
                     let _ = call_user_function(params, body, &[], child, &mut local_state);
                 });
                 state.active_coroutines.insert(routine_name, handle);
@@ -261,6 +281,9 @@ fn call_user_function(
     if !args.is_empty() && args.iter().all(|(label, _)| label.is_some()) {
         for (label, expr) in args {
             let label = label.clone().unwrap();
+            if !params.contains(&label) {
+                return Err(format!("Unknown argument '{}' for function", label));
+            }
             let val = evaluate_expression(expr.clone(), Arc::clone(&env), state)?;
             call_env.lock().unwrap().define(label, val)?;
         }
@@ -309,20 +332,63 @@ fn extract_arg(
             }
         }
     }
+    Err(format!("Missing required argument '{}'", label))
+}
+
+fn extract_optional_arg(
+    args: &[(Option<String>, Expression)],
+    label: &str,
+    env: Arc<Mutex<Environment>>,
+    state: &mut RuntimeState,
+) -> Result<RuntimeValue, String> {
+    for (opt_label, expr) in args {
+        if let Some(l) = opt_label {
+            if l == label {
+                return evaluate_expression(expr.clone(), env, state);
+            }
+        }
+    }
     Ok(RuntimeValue::Null)
 }
 
 fn runtime_number(val: RuntimeValue, label: &str) -> Result<f64, String> {
     match val {
         RuntimeValue::Number(n) => Ok(n),
-        _ => Err(format!("Expected number for '{}'", label)),
+        other => Err(format!(
+            "Expected number for '{}', got {}",
+            label,
+            value_type_name(&other)
+        )),
     }
 }
 
 fn runtime_string(val: RuntimeValue, label: &str) -> Result<String, String> {
     match val {
         RuntimeValue::String(s) => Ok(s),
-        _ => Err(format!("Expected string for '{}'", label)),
+        other => Err(format!(
+            "Expected string for '{}', got {}",
+            label,
+            value_type_name(&other)
+        )),
+    }
+}
+
+fn resolve_script_path(script_dir: &std::path::Path, path: String) -> String {
+    let candidate = std::path::Path::new(&path);
+    if candidate.is_absolute() {
+        return path;
+    }
+    script_dir.join(candidate).to_string_lossy().into_owned()
+}
+
+fn value_type_name(val: &RuntimeValue) -> &'static str {
+    match val {
+        RuntimeValue::Number(_) => "number",
+        RuntimeValue::String(_) => "string",
+        RuntimeValue::Boolean(_) => "boolean",
+        RuntimeValue::Script(_) => "script",
+        RuntimeValue::Function { .. } => "function",
+        RuntimeValue::Null => "null/undefined",
     }
 }
 
@@ -365,7 +431,7 @@ fn run_http_server(
         return;
     }
 
-    println!("UTA server listening on http://{}", addr);
+    println!("UTA server listening on http://{} (serving {})", addr, file_path);
 
     if let Some(ms) = timeout_ms {
         let shutdown_timeout = Arc::clone(&shutdown);
@@ -407,6 +473,61 @@ fn serve_http(mut stream: TcpStream, file_path: &str) {
     );
 
     let _ = stream.write_all(response.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{Expression, Statement};
+    use crate::parser::Parser;
+
+    fn env_with_script2_vars() -> (Arc<Mutex<Environment>>, RuntimeState) {
+        let src = include_str!("../script2.web");
+        let program = Parser::parse(src).unwrap();
+        let declarations: Vec<Statement> = program
+            .into_iter()
+            .filter(|s| matches!(s, Statement::VarDeclaration { .. }))
+            .collect();
+        let env = Arc::new(Mutex::new(Environment::new()));
+        let mut state = RuntimeState::new(std::env::current_dir().unwrap());
+        execute_program(declarations, env.clone(), &mut state).unwrap();
+        (env, state)
+    }
+
+    #[test]
+    fn script2_const_variables_are_defined() {
+        let (env, _) = env_with_script2_vars();
+        let e = env.lock().unwrap();
+        assert_eq!(e.get("port"), RuntimeValue::Number(8080.0));
+        assert_eq!(
+            e.get("file_descriptor"),
+            RuntimeValue::String("index.html".into())
+        );
+        assert_eq!(e.get("is_project"), RuntimeValue::Boolean(false));
+    }
+
+    #[test]
+    fn script2_resolves_variables_in_server_call() {
+        let (env, mut state) = env_with_script2_vars();
+        let args = vec![
+            (
+                Some("port".into()),
+                Expression::Variable("port".into()),
+            ),
+            (
+                Some("file_descriptor".into()),
+                Expression::Variable("file_descriptor".into()),
+            ),
+            (
+                Some("is_project".into()),
+                Expression::Variable("is_project".into()),
+            ),
+        ];
+        let port_val = extract_arg(&args, "port", env.clone(), &mut state).unwrap();
+        let page_val = extract_arg(&args, "file_descriptor", env, &mut state).unwrap();
+        assert_eq!(port_val, RuntimeValue::Number(8080.0));
+        assert_eq!(page_val, RuntimeValue::String("index.html".into()));
+    }
 }
 
 impl RuntimeValue {

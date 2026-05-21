@@ -297,6 +297,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_script2() {
+        let src = include_str!("../script2.web");
+        Parser::parse(src).expect("script2.web should parse");
+    }
+
+    #[test]
     fn parse_minimal_server_call() {
         let src = r#"start_server(port: 8080);"#;
         match Parser::parse(src) {

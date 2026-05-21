@@ -46,8 +46,14 @@ fn main() {
         }
     };
 
+    let script_dir = path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
     let env = Arc::new(Mutex::new(Environment::new()));
-    let mut state = RuntimeState::new();
+    let mut state = RuntimeState::new(script_dir);
 
     if let Err(e) = execute_program(program, env, &mut state) {
         eprintln!("UTA Runtime Error: {}", e);

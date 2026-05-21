@@ -1,6 +1,6 @@
-// variables
-const my_port = 8080;
-const page = "index.html";
-const check = false;
+// Variables passed into builtin named arguments
+const port = 8080;
+const file_descriptor = "index.html";
+const is_project = false;
 
-start_server(port: my_port, file_descriptor: page, is_project: check);
+start_server(port: port, file_descriptor: file_descriptor, is_project: is_project);
