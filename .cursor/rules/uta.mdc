@@ -1,0 +1,48 @@
+---
+description: UTA language engine — lexer, parser, eval, and .web scripts
+globs: "{src/**/*.rs,**/*.web,README.md,AGENTS.md}"
+alwaysApply: true
+---
+
+# UTA Project Rules
+
+## Source of truth
+- Syntax and builtins: `README.md` (update README when changing public behavior).
+- Engine architecture: `AGENTS.md`.
+
+## Pipeline (required)
+Lexer (`src/lexer.rs`) → Parser (`src/parser.rs`) → Eval (`src/eval.rs`). No regex parsing of `.web` source.
+
+## Implemented builtin signatures (use exactly)
+```uta
+start_server(port: <number>, file_descriptor: <string>, is_project: <boolean> [, time_out: <number_ms>]);
+end_server(port: <number>);
+time_out(time: <number_ms>);
+sleep(time: <number_ms>);
+start_coroutine(routine_name: <string>, func: <function>);
+end_coroutine(routine_name: <string>);
+```
+- All builtin args are **named** (`label: value`).
+- Optional server stop: `time_out: 0` or omit `time_out` = run until `end_server`.
+- `file_descriptor` paths are relative to the **`.web` file's directory** (not cwd).
+
+## `.web` script conventions
+```uta
+const port = 8080;
+const file_descriptor = "index.html";
+const is_project = false;
+start_server(port: port, file_descriptor: file_descriptor, is_project: is_project);
+```
+
+## Before claiming a fix works
+1. `cargo build` succeeds (edition 2021).
+2. `cargo test` passes.
+3. `cargo run -- script.web` prints `UTA server listening on http://127.0.0.1:8080`.
+4. `http://127.0.0.1:8080` returns HTTP 200 with `index.html` body.
+5. If port 8080 is busy, error message tells user how to free it.
+
+## Do not
+- Invent syntax not in README without asking.
+- Use `mock_parser` or skip parsing real file content.
+- Return `Null` for undefined variables (must error).
+- Block the main thread on `sleep` or `start_coroutine`.

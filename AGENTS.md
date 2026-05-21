@@ -1,37 +1,80 @@
-# Role & Context
-You are an expert systems engineer and compiler specialist building **UTA**—a dynamically typed, programming language implemented in Rust designed to run local web servers and render script fragments.
+# UTA — Agent Guide
 
-## Core Directives
-1. **Source of Truth:** Base all implementations strictly on `README.md` (or your prompt specs). Do not guess or invent syntax constructs, standard libraries, or type behaviors that are not documented.
-2. **Consult First:** If you encounter a syntax rule, edge case, or implementation detail not explicitly covered in the design spec, **STOP and ask the user for guidance**. Do not attempt to design features independently.
-3. **No String Hacks:** Write a structured compiler pipeline. Do not use brittle regex strings or global split hacks to parse code. Implement a robust character-by-character Lexer and an Abstract Syntax Tree (AST) Parser.
-4. **Rust Best Practices:** Keep code idiomatic. Leverage explicit typing, `Arc<Mutex<Environment>>` or scoped pointers for runtime tracking, and handle errors cleanly using `Result` types instead of scattering unwrap calls.
+You are building **UTA**: a dynamically typed language in Rust that runs `.web` scripts, serves local HTML, and renders HTML via tag macros.
 
----
+## Source of truth
+1. **`README.md`** — language syntax and builtins (keep in sync with code).
+2. **`AGENTS.md`** (this file) — engine architecture and agent workflow.
+3. **`.cursor/rules/uta.mdc`** — Cursor rules (always applied in this repo).
 
-## Technical Pipeline Architecture
+If behavior is missing from the spec, stop and ask:
+`[Spec Ambiguity Encountered]: <gap>. Please provide guidance.`
 
-### 1. Lexer (Tokenization)
-- Break the `.web` text down into granular tokens: `KwLet`, `KwConst`, `KwDo`, `KwEnd`, `Identifier(String)`, `Number(f64)`, `String(String)`, `Symbol(char)`.
+## Architecture (mandatory)
 
-### 2. Parser (AST Generation)
-- Implement a recursive-descent parser to convert tokens into statements and expressions.
-- Handle blocks cleanly by tracking `do` and matching `end;` terminators.
+```
+.web file → Lexer → Parser → AST → Evaluator → builtins / HTTP
+```
 
-### 3. Environment & Evaluation Loop
-- Maintain a proper parent-link scope environment lookup map to support local blocks (`if`) and function stack variables.
-- Dynamically parse and enforce variable immutability rules.
+| Module | Role |
+|--------|------|
+| `src/lexer.rs` | Char-by-char tokens. No regex on source. |
+| `src/parser.rs` | Recursive descent; blocks end with `end;` |
+| `src/ast.rs` | `Statement`, `Expression`, `RuntimeValue` |
+| `src/eval.rs` | Environment, builtins, HTTP server |
+| `src/main.rs` | CLI: validate `.web`, parse, run |
 
----
+## Implemented builtins (use in scripts/tests)
 
-## Constraints Checklist
-- File validation: Strictly reject any execution path where the target file extension does not equal `.web`.
-- Concurrency operations: Ensure `start_coroutine` or `sleep` runs inside separate native background threads so they never stall the engine loop execution.
-- Macros: Map unknown calls directly to raw HTML tags if they evaluate to a `script` type payload.
+```uta
+start_server(port: <expr>, file_descriptor: <expr>, is_project: <expr> [, time_out: <expr>]);
+end_server(port: <expr>);
+time_out(time: <expr>);
+sleep(time: <expr>);
+start_coroutine(routine_name: <expr>, func: <expr>);
+end_coroutine(routine_name: <expr>);
+```
 
----
+- Arguments are **always named** (`port: 8080`, not positional).
+- `time_out` on `start_server`: milliseconds; `0` or omitted = no auto-stop.
+- `file_descriptor`: path relative to the **script file's folder**.
+- Unknown `name(...)` calls → HTML tag macro (`h1("text")` → `<h1>text</h1>`).
 
-## Mode of Interaction
-- Before creating a new file or modifying structural architectural layout systems, outline your implementation step plan briefly to the user.
-- If a specific parameter or execution edge-case is missing from an issue description or spec file, output:
-  `[Spec Ambiguity Encountered]: <Describe the gap here>. Please provide guidance on how UTA should handle this.`
+## Variables
+- `const name = <expr>;` — immutable binding.
+- Variables used before definition → runtime error (not silent null).
+- Lookup: child scope → parent chain (`Arc<Mutex<Environment>>`).
+
+## Constraints checklist
+- [ ] Reject non-`.web` files at CLI.
+- [ ] Parse and execute the **actual file contents** (no mock AST).
+- [ ] `sleep` / `start_coroutine` on background threads.
+- [ ] `start_server` binds in a background thread; main waits until server stops.
+- [ ] `SO_REUSEADDR` + stop in-process server on same port before rebind.
+- [ ] Verify `index.html` (or given path) exists before binding.
+
+## Verification workflow (run before saying "fixed")
+
+```powershell
+cd D:\practice\uta
+cargo build
+cargo test
+# Free port 8080 if a previous run is still active:
+netstat -ano | findstr :8080
+cargo run -- script.web
+# Browser: http://127.0.0.1:8080 — expect "Hallo" from index.html
+```
+
+## Common failures
+
+| Symptom | Cause | Fix |
+|---------|--------|-----|
+| Port already in use | Previous `cargo run` still running | Kill PID from `netstat` or `Stop-Process` |
+| Could not read index.html | Wrong cwd or path | Use path relative to `.web` file; run from repo root |
+| Undefined variable | Typo or const not defined yet | Define `const` before use |
+| Parse error on `:` | Named arg parsing bug | Use `port: value` syntax; see parser tests |
+
+## Interaction mode
+- Outline plan before large structural changes.
+- Prefer minimal, focused diffs.
+- After engine changes, update `README.md`, sample `.web` scripts, and tests together.

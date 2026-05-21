@@ -1,0 +1,9 @@
+// Dev script — auto-stops after 5 minutes (no Ctrl+C needed)
+// Run: cargo run -- script_dev.web
+
+const port = 8080;
+const file_descriptor = "index.html";
+const is_project = false;
+const time_out = 300000;
+
+start_server(port: port, file_descriptor: file_descriptor, is_project: is_project, time_out: time_out);

@@ -1,7 +1,7 @@
 use crate::ast::{Expression, RuntimeValue, Statement};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use socket2::{Domain, Socket, Type};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -213,7 +213,15 @@ fn evaluate_call(
             let timeout_val = extract_optional_arg(args, "time_out", Arc::clone(&env), state)?;
 
             let port = runtime_number(port_val, "port")? as u16;
-            let file_path = resolve_script_path(&state.script_dir, runtime_string(file_val, "file_descriptor")?);
+            let file_descriptor = runtime_string(file_val, "file_descriptor")?;
+            let file_path = resolve_script_path(&state.script_dir, file_descriptor.clone());
+
+            if !std::path::Path::new(&file_path).is_file() {
+                return Err(format!(
+                    "file_descriptor '{}' not found (resolved to '{}')",
+                    file_descriptor, file_path
+                ));
+            }
 
             state.stop_server(port);
             thread::sleep(Duration::from_millis(50));
@@ -227,7 +235,7 @@ fn evaluate_call(
             state.servers.insert(port, Arc::clone(&shutdown));
 
             let timeout_ms = match timeout_val {
-                RuntimeValue::Number(ms) => Some(ms as u64),
+                RuntimeValue::Number(ms) if ms > 0.0 => Some(ms as u64),
                 _ => None,
             };
 
@@ -375,10 +383,16 @@ fn runtime_string(val: RuntimeValue, label: &str) -> Result<String, String> {
 
 fn resolve_script_path(script_dir: &std::path::Path, path: String) -> String {
     let candidate = std::path::Path::new(&path);
-    if candidate.is_absolute() {
-        return path;
-    }
-    script_dir.join(candidate).to_string_lossy().into_owned()
+    let resolved = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        script_dir.join(candidate)
+    };
+    resolved
+        .canonicalize()
+        .unwrap_or(resolved)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn value_type_name(val: &RuntimeValue) -> &'static str {
@@ -431,7 +445,10 @@ fn run_http_server(
         return;
     }
 
-    println!("UTA server listening on http://{} (serving {})", addr, file_path);
+    let display_path = file_path.strip_prefix(r"\\?\").unwrap_or(&file_path);
+    println!("UTA server listening on http://{}", addr);
+    println!("  Serving: {}", display_path);
+    println!("  Open in browser: http://{}", addr);
 
     if let Some(ms) = timeout_ms {
         let shutdown_timeout = Arc::clone(&shutdown);
@@ -462,17 +479,41 @@ fn run_http_server(
 }
 
 fn serve_http(mut stream: TcpStream, file_path: &str) {
-    let content = fs::read_to_string(file_path).unwrap_or_else(|_| {
-        format!("<html><body><p>UTA: could not read '{}'</p></body></html>", file_path)
+    let _ = drain_http_request(&mut stream);
+
+    let body = fs::read_to_string(file_path).unwrap_or_else(|e| {
+        format!(
+            "<html><body><h1>UTA Error</h1><p>Could not read '{}': {}</p></body></html>",
+            file_path, e
+        )
     });
+    let body_bytes = body.as_bytes();
 
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        content.len(),
-        content
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
     );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body_bytes);
+    let _ = stream.flush();
+}
 
-    let _ = stream.write_all(response.as_bytes());
+fn drain_http_request(stream: &mut TcpStream) -> std::io::Result<()> {
+    let mut buf = [0u8; 1024];
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    stream.set_read_timeout(None)?;
+    Ok(())
 }
 
 #[cfg(test)]

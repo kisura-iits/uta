@@ -1,4 +1,6 @@
-// Variables passed into builtin named arguments
+// Same as script.web but shows variables in named builtin args
+// Run: cargo run -- script2.web
+
 const port = 8080;
 const file_descriptor = "index.html";
 const is_project = false;
