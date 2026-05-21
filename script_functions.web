@@ -1,0 +1,25 @@
+// Demo: user-defined functions + builtins
+// Run: cargo run -- script_functions.web
+
+let warmup() do
+    sleep(time: 100);
+end;
+
+warmup();
+
+let page() -> script do
+    return h1("Hello from UTA functions");
+end;
+
+page();
+
+start_coroutine(routine_name: "bg", func: let() do
+    sleep(time: 200);
+end);
+
+const port = 8080;
+const file_descriptor = "index.html";
+const is_project = false;
+const time_out = 300000;
+
+start_server(port: port, file_descriptor: file_descriptor, is_project: is_project, time_out: time_out);

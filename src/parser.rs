@@ -163,6 +163,7 @@ impl Parser {
                 self.advance();
                 Ok(Expression::Literal(RuntimeValue::Boolean(false)))
             }
+            Token::KwLet => self.parse_anon_function_literal(),
             Token::Identifier(name) => {
                 self.advance();
                 if self.check(&Token::Symbol('(')) {
@@ -173,6 +174,30 @@ impl Parser {
             }
             _ => Err(format!("Unexpected token in expression: {:?}", self.current())),
         }
+    }
+
+    fn parse_anon_function_literal(&mut self) -> Result<Expression, String> {
+        self.advance(); // let
+        self.expect_symbol('(')?;
+        let params = self.parse_param_list()?;
+        self.expect_symbol(')')?;
+
+        let return_type = if self.check(&Token::Arrow) {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
+
+        self.expect_keyword(Token::KwDo)?;
+        let body = self.parse_block()?;
+        self.expect_keyword(Token::KwEnd)?;
+
+        Ok(Expression::Literal(RuntimeValue::Function {
+            params,
+            body,
+            return_type,
+        }))
     }
 
     fn parse_call(&mut self, name: String) -> Result<Expression, String> {
@@ -300,6 +325,22 @@ mod tests {
     fn parse_script2() {
         let src = include_str!("../script2.web");
         Parser::parse(src).expect("script2.web should parse");
+    }
+
+    #[test]
+    fn parse_anon_function_in_coroutine() {
+        let src = r#"start_coroutine(routine_name: "t", func: let() do end);"#;
+        Parser::parse(src).expect("anonymous let() should parse");
+    }
+
+    #[test]
+    fn parse_user_function_and_call() {
+        let src = r#"
+let ping() do
+end;
+ping();
+"#;
+        Parser::parse(src).expect("user function should parse");
     }
 
     #[test]

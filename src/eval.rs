@@ -130,7 +130,8 @@ fn execute_statement(
             Ok(None)
         }
         Statement::Expression(expr) => {
-            evaluate_expression(expr, Arc::clone(&env), state)?;
+            let val = evaluate_expression(expr, Arc::clone(&env), state)?;
+            log_script_result(&val);
             Ok(None)
         }
         Statement::Return(expr) => {
@@ -183,10 +184,10 @@ fn evaluate_call(
         if let RuntimeValue::Function {
             params,
             body,
-            return_type: _,
+            return_type,
         } = callee
         {
-            return call_user_function(params, body, args, env, state);
+            return call_user_function(params, body, return_type, args, env, state);
         }
     }
 
@@ -254,15 +255,24 @@ fn evaluate_call(
             let func_val = extract_arg(args, "func", Arc::clone(&env), state)?;
             let routine_name = runtime_string(name_val, "routine_name")?;
 
-            if let RuntimeValue::Function { params, body, .. } = func_val {
-                let child = Arc::new(Mutex::new(Environment::child(Arc::clone(&env))));
-                let script_dir = state.script_dir.clone();
-                let handle = thread::spawn(move || {
-                    let mut local_state = RuntimeState::new(script_dir);
-                    let _ = call_user_function(params, body, &[], child, &mut local_state);
-                });
-                state.active_coroutines.insert(routine_name, handle);
-            }
+            let RuntimeValue::Function {
+                params,
+                body,
+                return_type,
+            } = func_val
+            else {
+                return Err(
+                    "start_coroutine requires func: to be a function (use let() do ... end)"
+                        .to_string(),
+                );
+            };
+            let child = Arc::new(Mutex::new(Environment::child(Arc::clone(&env))));
+            let script_dir = state.script_dir.clone();
+            let handle = thread::spawn(move || {
+                let mut local_state = RuntimeState::new(script_dir);
+                let _ = call_user_function(params, body, return_type, &[], child, &mut local_state);
+            });
+            state.active_coroutines.insert(routine_name, handle);
             Ok(RuntimeValue::Null)
         }
         "end_coroutine" => {
@@ -280,33 +290,73 @@ fn evaluate_call(
 fn call_user_function(
     params: Vec<String>,
     body: Vec<Statement>,
+    return_type: Option<String>,
     args: &[(Option<String>, Expression)],
     env: Arc<Mutex<Environment>>,
     state: &mut RuntimeState,
 ) -> Result<RuntimeValue, String> {
     let call_env = Arc::new(Mutex::new(Environment::child(Arc::clone(&env))));
+    bind_call_arguments(&params, args, Arc::clone(&env), Arc::clone(&call_env), state)?;
 
-    if !args.is_empty() && args.iter().all(|(label, _)| label.is_some()) {
+    let result = execute_program(body, call_env, state)?;
+    let value = result.unwrap_or(RuntimeValue::Null);
+    validate_return_type(return_type.as_deref(), &value)?;
+    Ok(value)
+}
+
+fn bind_call_arguments(
+    params: &[String],
+    args: &[(Option<String>, Expression)],
+    caller_env: Arc<Mutex<Environment>>,
+    call_env: Arc<Mutex<Environment>>,
+    state: &mut RuntimeState,
+) -> Result<(), String> {
+    if args.is_empty() {
+        return Ok(());
+    }
+
+    if args.iter().all(|(label, _)| label.is_some()) {
         for (label, expr) in args {
             let label = label.clone().unwrap();
             if !params.contains(&label) {
                 return Err(format!("Unknown argument '{}' for function", label));
             }
-            let val = evaluate_expression(expr.clone(), Arc::clone(&env), state)?;
+            let val = evaluate_expression(expr.clone(), Arc::clone(&caller_env), state)?;
             call_env.lock().unwrap().define(label, val)?;
         }
-    } else {
-        for (i, (_, expr)) in args.iter().enumerate() {
-            if i >= params.len() {
-                break;
-            }
-            let val = evaluate_expression(expr.clone(), Arc::clone(&env), state)?;
-            call_env.lock().unwrap().define(params[i].clone(), val)?;
-        }
+        return Ok(());
     }
 
-    let result = execute_program(body, call_env, state)?;
-    Ok(result.unwrap_or(RuntimeValue::Null))
+    for (i, (_, expr)) in args.iter().enumerate() {
+        if i >= params.len() {
+            return Err(format!(
+                "Too many arguments: expected {}, got {}",
+                params.len(),
+                args.len()
+            ));
+        }
+        let val = evaluate_expression(expr.clone(), Arc::clone(&caller_env), state)?;
+        call_env.lock().unwrap().define(params[i].clone(), val)?;
+    }
+    Ok(())
+}
+
+fn validate_return_type(return_type: Option<&str>, value: &RuntimeValue) -> Result<(), String> {
+    if let Some("script") = return_type {
+        if !matches!(value, RuntimeValue::Script(_)) {
+            return Err(format!(
+                "Function declared -> script must return script HTML, got {}",
+                value_type_name(value)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn log_script_result(val: &RuntimeValue) {
+    if let RuntimeValue::Script(html) = val {
+        println!("UTA script output:\n{}", html);
+    }
 }
 
 fn html_tag_macro(
@@ -545,6 +595,33 @@ mod tests {
             RuntimeValue::String("index.html".into())
         );
         assert_eq!(e.get("is_project"), RuntimeValue::Boolean(false));
+    }
+
+    #[test]
+    fn user_script_function_returns_html() {
+        let src = r#"
+let page() -> script do
+    return h1("hi");
+end;
+page();
+"#;
+        let program = Parser::parse(src).unwrap();
+        let env = Arc::new(Mutex::new(Environment::new()));
+        let mut state = RuntimeState::new(std::env::current_dir().unwrap());
+        execute_program(program, env, &mut state).unwrap();
+    }
+
+    #[test]
+    fn user_function_can_be_called() {
+        let src = r#"
+let ping() do
+end;
+ping();
+"#;
+        let program = Parser::parse(src).unwrap();
+        let env = Arc::new(Mutex::new(Environment::new()));
+        let mut state = RuntimeState::new(std::env::current_dir().unwrap());
+        execute_program(program, env, &mut state).unwrap();
     }
 
     #[test]

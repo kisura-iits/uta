@@ -45,6 +45,24 @@ end_coroutine(routine_name: <expr>);
 - Variables used before definition → runtime error (not silent null).
 - Lookup: child scope → parent chain (`Arc<Mutex<Environment>>`).
 
+## User-defined functions
+```uta
+let name() do
+    // statements
+end;
+
+let name() -> script do
+    return h1("Hello");
+end;
+
+name();                          // call, no args
+name(arg: value);                // named args
+let() do end;                    // anonymous (expression)
+start_coroutine(routine_name: "r", func: let() do end);
+```
+- `-> script` functions must `return` a `script` value (HTML macro result).
+- Calling a `script` function prints HTML to the console.
+
 ## Constraints checklist
 - [ ] Reject non-`.web` files at CLI.
 - [ ] Parse and execute the **actual file contents** (no mock AST).
